@@ -3,15 +3,12 @@ from itertools import islice
 import json
 import os
 from pathlib import Path
+import pickle
 import shutil
-import warnings
 from typing import Callable, Dict
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import fbeta_score
-from sklearn.exceptions import UndefinedMetricWarning
 import torch
 from torch import nn, cuda
 from torch.optim import Adam, SGD, lr_scheduler
@@ -21,8 +18,7 @@ from . import models
 from .dataset import TrainDataset, ValDataset, TestDataset, DATA_ROOT
 from .transforms import get_transforms
 from .utils import (
-    write_event, load_model, mean_df, ThreadingDataLoader as DataLoader,
-    FocalLoss, ON_KAGGLE)
+    write_event, load_model, ThreadingDataLoader as DataLoader, ON_KAGGLE)
 
 
 def main():
@@ -55,18 +51,10 @@ def main():
 
     run_root = Path(args.run_root)
     train_root = DATA_ROOT / 'train'
-    df = pd.read_csv(DATA_ROOT / 'train.csv', index_col="Image")
 
-    df_identified = df[df.Id != "new_whale"]
-    df_train, df_val = train_test_split(df_identified, test_size=0.05, random_state=0)
-    num_items = df_train.Id.value_counts()
-    not_paired = []
-    for idx, row in df_train.iterrows():
-        if num_items[row.Id] == 1:
-            not_paired.append(idx)
-
-    df_val = df_val.append(df_train.loc[not_paired])
-    df_train = df_train.drop(not_paired)
+    df_identified = pd.read_csv('df_identified.csv', index_col="Image")
+    df_train = pd.read_csv('df_train.csv', index_col="Image")
+    df_val = pd.read_csv('df_val.csv', index_col="Image")
 
     if args.limit:
         df_train = df_train[:args.limit]
@@ -88,16 +76,16 @@ def main():
     if use_cuda:
         model = model.cuda()
 
+    if args.prev_model != 'none' and not (run_root / 'model.pt').exists():
+        shutil.copy(os.path.join(args.prev_model, 'best-model.pt'), str(run_root))
+        shutil.copy(os.path.join(args.prev_model, 'model.pt'), str(run_root))
+
     if args.mode == 'train':
         if run_root.exists() and args.clean:
             shutil.rmtree(run_root)
         run_root.mkdir(exist_ok=True, parents=True)
         (run_root / 'params.json').write_text(
             json.dumps(vars(args), indent=4, sort_keys=True))
-
-        if args.prev_model != 'none':
-            shutil.copy(os.path.join(args.prev_model, 'best-model.pt'), str(run_root))
-            shutil.copy(os.path.join(args.prev_model, 'model.pt'), str(run_root))
 
         train_loader = DataLoader(
             dataset=TrainDataset(train_root, df_train, train_transform, debug=args.debug),
@@ -115,9 +103,11 @@ def main():
               f'{len(valid_loader.dataset):,} in valid')
 
         if args.optim == 'sgd':
-            init_optimizer = lambda params, lr: SGD(params, lr) # no momentum
+            init_optimizer = SGD # no momentum
+        elif args.optim == 'sgd_mom':
+            init_optimizer = lambda params, lr: SGD(params, lr, momentum=0.9)
         else:
-            init_optimizer = lambda params, lr: Adam(params, lr)
+            init_optimizer = Adam
 
         train_kwargs = dict(
             args=args,
@@ -156,37 +146,80 @@ def main():
             use_cuda=use_cuda,
             workers=args.workers,
         )
+        train_loader = DataLoader(
+            dataset=TestDataset(train_root, df_train, test_transform),
+            shuffle=False,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+        )
+
         if args.mode == 'predict_valid':
-            predict(args, model, df=df_val, root=train_root,
+            test_loader = DataLoader(
+                dataset=TestDataset(train_root, df_val, test_transform),
+                shuffle=False,
+                batch_size=args.batch_size,
+                num_workers=args.workers,
+            )
+            predict(args, model, train_loader, test_loader, df_identified,
                     out_path=run_root / 'val.h5', **predict_kwargs)
+
         elif args.mode == 'predict_test':
             test_root = DATA_ROOT / 'test'
             ss = pd.read_csv(DATA_ROOT / 'sample_submission.csv', index_col='Image')
             if args.limit:
                 ss = ss[:args.limit]
-            predict(args, model, df=ss, root=test_root,
-                    out_path=run_root / 'test.h5',
-                    **predict_kwargs)
+            test_loader = DataLoader(
+                dataset=TestDataset(test_root, ss, test_transform),
+                shuffle=False,
+                batch_size=args.batch_size,
+                num_workers=args.workers,
+            )
+            predict(args, model, train_loader, test_loader, df_identified,
+                    out_path=run_root / 'test.h5', **predict_kwargs)
 
 
-def predict(args, model, root: Path, df: pd.DataFrame, out_path: Path,
-            batch_size: int, transform: Callable,
+def predict(args, model, train_loader, test_loader, df,
+            out_path: Path, batch_size: int, transform: Callable,
             workers: int, use_cuda: bool):
-    loader = DataLoader(
-        dataset=TestDataset(root, df, transform),
-        shuffle=False,
-        batch_size=batch_size,
-        num_workers=workers,
-    )
+    whale_names = sorted(set(df.Id))
+    id_to_image = {}
+    for name in whale_names:
+        id_to_image[name] = list(df[df.Id == name].Image)
+    
     model.eval()
-    all_outputs, all_ids = [], []
+    train_features, test_features = {}, {}
     with torch.no_grad():
-        for inputs, ids in tqdm.tqdm(loader, desc='Predict', disable=not args.verbose):
+        for inputs, image in tqdm.tqdm(train_loader, desc='Train Features', disable=not args.verbose):
             if use_cuda:
                 inputs = inputs.cuda()
-            outputs = model(inputs)
-            all_outputs.append(outputs.data.cpu().numpy())
-            all_ids.extend(ids)
+            outputs = model.forward_once(inputs)
+            train_features[image] = outputs.data.cpu().numpy()
+        for inputs, image in tqdm.tqdm(test_loader, desc='Test features', disable=not args.verbose):
+            if use_cuda:
+                inputs = inputs.cuda()
+            outputs = model.forward_once(inputs)
+            test_features[image] = outputs.data.cpu().numpy()
+
+    test_preds = {}
+    for test_img, test_feat in test_features.items():
+        if use_cuda:
+            test_feat = test_feat.cuda()
+        preds = []
+        for name in whale_names:
+            best_score = float('int')
+            for train_img in id_to_image[name]:
+                train_feat = train_features[train_img]
+                if use_cuda:
+                    train_feat = train_feat.cuda()
+                with torch.no_grad():
+                    score = model.forward_head()
+                score = float(score[:, 1])
+                if score < best_score:
+                    best_score = score
+            preds.append(best_score)
+        test_preds[test_img] = np.array(preds)
+
+    pickle.dump(test_preds, out_path)
     print(f'Saved predictions to {out_path}')
 
 
@@ -294,7 +327,7 @@ def train(args, model: nn.Module, criterion, *, params,
                 shutil.copy(str(model_path), str(best_model_path))
             elif (patience and epoch - lr_reset_epoch > patience and
                   min(valid_losses[-patience:]) > best_valid_loss and
-                  args.scheduler == 'none'):
+                  args.scheduler == 'patience'):
                 # "patience" epochs without improvement
                 lr_changes += 1
                 if lr_changes > max_lr_changes:

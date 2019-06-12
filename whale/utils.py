@@ -50,7 +50,17 @@ def load_model(model: nn.Module, path: Path) -> Dict:
 
 
 class ThreadingDataLoader(DataLoader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.count = 0
+        self.dataset.initialize_epoch()
+
     def __iter__(self):
+        if self.count >= len(self.dataset):
+            self.count = 0
+            self.dataset.initialize_epoch()
+        self.count += self.batch_size
+
         sample_iter = iter(self.batch_sampler)
         if self.num_workers == 0:
             for indices in sample_iter:

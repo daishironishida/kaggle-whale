@@ -15,20 +15,28 @@ from .utils import ON_KAGGLE
 DATA_ROOT = Path('../input/humpback-whale-identification' if ON_KAGGLE else './data')
 
 
-class TrainDataset(Dataset):
+class CustomDataset(Dataset):
+    def initialize_epoch(self):
+        pass
+
+    def __getitem__(self, index):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+
+
+class TrainDataset(CustomDataset):
     def __init__(self, root:Path, df: pd.DataFrame,
                  image_transform: Callable, debug: bool=True):
         self.root = root
         self.df = df
         self.image_transform = image_transform
         self.debug = debug
-
         self.train_list = []
-        self.count = 0
-        self.initialize_pair_list()
 
     # 一周したらペアのリストを作り直す
-    def initialize_pair_list(self):
+    def initialize_epoch(self):
         # different pairs
         while True:
             img_list = []
@@ -60,11 +68,9 @@ class TrainDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        if self.count == len(self.df) * 2:
-            self.count = 0
-            self.initialize_pair_list()
-
-        self.count += 1
+        if idx >= len(self.train_list):
+            print("idx: ", idx)
+            print("train list: ", len(self.train_list))
 
         img0_name, img1_name, label = self.train_list[idx]
         image0 = load_transform_image(
@@ -75,7 +81,7 @@ class TrainDataset(Dataset):
         return image0, image1, label
 
 
-class ValDataset(Dataset):
+class ValDataset(CustomDataset):
     def __init__(self, root: Path, df: pd.DataFrame,
                  image_transform: Callable):
         self.root = root
@@ -112,7 +118,7 @@ class ValDataset(Dataset):
                 return image0, image1, 0
 
 
-class TestDataset(Dataset):
+class TestDataset(CustomDataset):
     def __init__(self, root: Path, df: pd.DataFrame,
                  image_transform: Callable):
         self.root = root
@@ -125,7 +131,7 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         item = self.df.iloc[idx]
         image = load_transform_image(item.index, self.root, self.image_transform)
-        return image, item.id
+        return image, item.Image
 
 
 def derange(list_a):

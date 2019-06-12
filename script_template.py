@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Dict
 
-n_epochs = 3
+n_epochs = 20
 image_size = 288
 batch_size = 32
 step_size = 1
@@ -35,6 +35,7 @@ def run(command):
 
 
 run('python setup.py develop --install-dir /kaggle/working')
+run('python -m whale.train_test_split')
 run('python -m whale.main train model_1 --model {} --dropout {} --image-size {} --batch-size {} --step {} --n-epochs {} --patience {} --lr {} --loss {} --transform {} --optim {} --scheduler {} --schedule-length {} --prev-model {}'.format(
     model, dropout, image_size, batch_size, step_size, n_epochs, patience, lr, loss, transform, optim, scheduler, schedule_length, prev_model))
 run('python -m whale.main predict_test model_1 --model {} --dropout {} --image-size {} --batch-size {} --transform {}'.format(

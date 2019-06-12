@@ -63,7 +63,7 @@ class ResNet(nn.Module):
     def forward(self, input1, input2):
         feature1 = self.forward_once(input1)
         feature2 = self.forward_once(input2)
-        return torch.sigmoid(self.forward_head(feature1, feature2))
+        return torch.softmax(self.forward_head(feature1, feature2), dim=1)
 
 
 resnet18 = partial(ResNet, net_cls=M.resnet18)
